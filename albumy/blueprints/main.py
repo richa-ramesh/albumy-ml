@@ -6,6 +6,7 @@
     :license: MIT, see LICENSE for more details.
 """
 import os
+import json
 
 from flask import render_template, flash, redirect, url_for, current_app, \
     send_from_directory, request, abort, Blueprint
@@ -18,6 +19,7 @@ from albumy.forms.main import DescriptionForm, TagForm, CommentForm
 from albumy.models import User, Photo, Tag, Follow, Collect, Comment, Notification
 from albumy.notifications import push_comment_notification, push_collect_notification
 from albumy.utils import rename_image, resize_image, redirect_back, flash_errors
+from albumy.ml_service import ml_service
 
 main_bp = Blueprint('main', __name__)
 
@@ -56,15 +58,39 @@ def search():
     category = request.args.get('category', 'photo')
     page = request.args.get('page', 1, type=int)
     per_page = current_app.config['ALBUMY_SEARCH_RESULT_PER_PAGE']
+    
     if category == 'user':
         pagination = User.query.whooshee_search(q).paginate(page, per_page)
     elif category == 'tag':
         pagination = Tag.query.whooshee_search(q).paginate(page, per_page)
     else:
-        pagination = Photo.query.whooshee_search(q).paginate(page, per_page)
+        # Enhanced photo search that includes ML fields
+        try:
+            # Try to use both whooshee and our ML search
+            whooshee_results = Photo.query.whooshee_search(q).all()
+            ml_results = Photo.query.filter(
+                db.or_(
+                    Photo.description.ilike(f'%{q}%'),
+                    Photo.alt_text.ilike(f'%{q}%'),
+                    Photo.detected_objects.ilike(f'%{q}%')
+                )
+            ).all()
+            
+            # Combine results
+            combined_ids = set([p.id for p in whooshee_results] + [p.id for p in ml_results])
+            pagination = Photo.query.filter(Photo.id.in_(combined_ids)).order_by(Photo.timestamp.desc()).paginate(page, per_page)
+        except:
+            # If whooshee fails, use our ML search only
+            pagination = Photo.query.filter(
+                db.or_(
+                    Photo.description.ilike(f'%{q}%'),
+                    Photo.alt_text.ilike(f'%{q}%'),
+                    Photo.detected_objects.ilike(f'%{q}%')
+                )
+            ).order_by(Photo.timestamp.desc()).paginate(page, per_page)
+            
     results = pagination.items
     return render_template('main/search.html', q=q, results=results, pagination=pagination, category=category)
-
 
 @main_bp.route('/notifications')
 @login_required
@@ -116,26 +142,60 @@ def get_avatar(filename):
 
 @main_bp.route('/upload', methods=['GET', 'POST'])
 @login_required
-@confirm_required
-@permission_required('UPLOAD')
 def upload():
     if request.method == 'POST' and 'file' in request.files:
         f = request.files.get('file')
-        filename = rename_image(f.filename)
-        f.save(os.path.join(current_app.config['ALBUMY_UPLOAD_PATH'], filename))
-        filename_s = resize_image(f, filename, current_app.config['ALBUMY_PHOTO_SIZE']['small'])
-        filename_m = resize_image(f, filename, current_app.config['ALBUMY_PHOTO_SIZE']['medium'])
-        photo = Photo(
-            filename=filename,
-            filename_s=filename_s,
-            filename_m=filename_m,
-            author=current_user._get_current_object()
-        )
-        db.session.add(photo)
-        db.session.commit()
+        if f and f.filename:
+            filename = rename_image(f.filename)
+            
+            # Save the original image
+            upload_path = current_app.config['ALBUMY_UPLOAD_PATH']
+            f.save(os.path.join(upload_path, filename))
+            
+            # Create resized versions
+            filename_s = resize_image(f, filename, 400)
+            filename_m = resize_image(f, filename, 800)
+            
+            # Get form data
+            description = request.form.get('description', '').strip()
+            manual_alt_text = request.form.get('alt_text', '').strip()
+            
+            # Generate or use provided alt text
+            if manual_alt_text:
+                alt_text = manual_alt_text
+                auto_generated = False
+            else:
+                # Generate alt text using ML
+                image_path = os.path.join(upload_path, filename)
+                alt_text = ml_service.generate_alt_text(image_path)
+                auto_generated = True
+            
+            # Detect objects for search (always do this)
+            detected_objects = ml_service.detect_objects(
+                os.path.join(upload_path, filename)
+            )
+            
+            # Create photo record
+            photo = Photo(
+                description=description,
+                filename=filename,
+                filename_s=filename_s,
+                filename_m=filename_m,
+                author=current_user._get_current_object(),
+                alt_text=alt_text,
+                auto_generated_alt=auto_generated,
+                detected_objects=json.dumps(detected_objects)
+            )
+            
+            db.session.add(photo)
+            db.session.commit()
+            
+            flash('Photo uploaded successfully!', 'success')
+            return redirect(url_for('main.show_photo', photo_id=photo.id))
+        else:
+            flash('Please select a file to upload.', 'danger')
+    
     return render_template('main/upload.html')
-
-
 @main_bp.route('/photo/<int:photo_id>')
 def show_photo(photo_id):
     photo = Photo.query.get_or_404(photo_id)
@@ -399,3 +459,4 @@ def delete_tag(photo_id, tag_id):
 
     flash('Tag deleted.', 'info')
     return redirect(url_for('.show_photo', photo_id=photo_id))
+

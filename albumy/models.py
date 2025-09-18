@@ -234,7 +234,11 @@ class Photo(db.Model):
     can_comment = db.Column(db.Boolean, default=True)
     flag = db.Column(db.Integer, default=0)
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-
+    
+    alt_text = db.Column(db.Text)  # Alternative text for accessibility
+    auto_generated_alt = db.Column(db.Boolean, default=False)  # Track if auto-generated
+    detected_objects = db.Column(db.Text)  # Store detected objects as JSON
+    
     author = db.relationship('User', back_populates='photos')
     comments = db.relationship('Comment', back_populates='photo', cascade='all')
     collectors = db.relationship('Collect', back_populates='collected', cascade='all')
